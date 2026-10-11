@@ -88,7 +88,7 @@ static auto videoTransportModeToString(AndroidAutoService::VideoTransportMode mo
   return QStringLiteral("unknown");
 }
 
-static auto extractH264ParameterSets(const QByteArray& frameData) -> QByteArray {
+static auto extractH264ParameterSet(const QByteArray& frameData, int wantedType) -> QByteArray {
   struct NaluStart {
     int start{0};
     int payload{0};
@@ -109,7 +109,6 @@ static auto extractH264ParameterSets(const QByteArray& frameData) -> QByteArray 
     }
   }
 
-  QByteArray parameterSets;
   for (int index = 0; index < nalus.size(); ++index) {
     const NaluStart& nalu = nalus.at(index);
     if (nalu.payload >= frameData.size()) {
@@ -117,15 +116,35 @@ static auto extractH264ParameterSets(const QByteArray& frameData) -> QByteArray 
     }
 
     const int type = static_cast<unsigned char>(frameData.at(nalu.payload)) & 0x1F;
-    if (type != 7 && type != 8) {
+    if (type != wantedType) {
       continue;
     }
 
     const int end = index + 1 < nalus.size() ? nalus.at(index + 1).start : frameData.size();
-    parameterSets.append(frameData.constData() + nalu.start, end - nalu.start);
+    return frameData.mid(nalu.start, end - nalu.start);
   }
+  return {};
+}
 
+static auto extractH264ParameterSets(const QByteArray& frameData) -> QByteArray {
+  QByteArray parameterSets;
+  parameterSets.append(extractH264ParameterSet(frameData, 7));
+  parameterSets.append(extractH264ParameterSet(frameData, 8));
   return parameterSets;
+}
+
+static auto mergeH264ParameterSets(const QByteArray& cached, const QByteArray& incoming)
+    -> QByteArray {
+  const QByteArray sps = [&]() {
+    const QByteArray current = extractH264ParameterSet(incoming, 7);
+    return current.isEmpty() ? extractH264ParameterSet(cached, 7) : current;
+  }();
+  const QByteArray pps = [&]() {
+    const QByteArray current = extractH264ParameterSet(incoming, 8);
+    return current.isEmpty() ? extractH264ParameterSet(cached, 8) : current;
+  }();
+
+  return sps + pps;
 }
 
 WebSocketServer::WebSocketServer(quint16 port, QObject* parent)
@@ -1250,7 +1269,7 @@ void WebSocketServer::setupAndroidAutoConnections() {
 
             const QByteArray parameterSets = extractH264ParameterSets(frameData);
             if (!parameterSets.isEmpty()) {
-              m_h264ParameterSets = parameterSets;
+              m_h264ParameterSets = mergeH264ParameterSets(m_h264ParameterSets, parameterSets);
             }
 
             if (!hasAnySubscriberForTopic(QStringLiteral("android-auto/media/video-frame"))) {
@@ -1314,6 +1333,12 @@ void WebSocketServer::onAndroidAutoStateChanged(int state) {
   Logger::instance().info(QString("[WebSocketServer] Android Auto state changed: %1").arg(state));
 
   if (state == static_cast<int>(AndroidAutoService::ConnectionState::CONNECTED)) {
+    if (m_lastConnectedStateMs == 0) {
+      m_h264ParameterSets.clear();
+      m_loggedH264ParameterSetReplay = false;
+      m_lastVideoFrameBroadcastMs = 0;
+      m_h264BroadcastCount = 0;
+    }
     m_lastConnectedStateMs = QDateTime::currentMSecsSinceEpoch();
   } else if (state == static_cast<int>(AndroidAutoService::ConnectionState::DISCONNECTED) ||
              state == static_cast<int>(AndroidAutoService::ConnectionState::ERROR)) {
@@ -1353,6 +1378,8 @@ void WebSocketServer::onAndroidAutoDeviceFound(const QVariantMap& device) {
 void WebSocketServer::onAndroidAutoDisconnected() {
   m_h264ParameterSets.clear();
   m_loggedH264ParameterSetReplay = false;
+  m_lastVideoFrameBroadcastMs = 0;
+  m_h264BroadcastCount = 0;
   QVariantMap payload;
   payload["connected"] = false;
   broadcastEvent("android-auto/status/disconnected", payload);
@@ -1464,6 +1491,14 @@ void WebSocketServer::onAndroidAutoProjectionStatus(const QJsonObject& status) {
   const QString reason = statusWithTransport.value(QStringLiteral("reason")).toString();
   const QString videoTransportMode =
     statusWithTransport.value(QStringLiteral("video_transport_mode")).toString();
+
+  if (reason == QStringLiteral("video_configured") ||
+    reason == QStringLiteral("video_started")) {
+    m_h264ParameterSets.clear();
+    m_loggedH264ParameterSetReplay = false;
+    m_lastVideoFrameBroadcastMs = 0;
+    m_h264BroadcastCount = 0;
+  }
 
   bool changed = !previousAvailable;
   if (previousAvailable) {
